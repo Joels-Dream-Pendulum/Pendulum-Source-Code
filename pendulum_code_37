@@ -1,0 +1,1231 @@
+
+/* TEMP  note to SElf
+ position = amplitude*cos(Time*360*Period)     //I do believe
+ 
+ *TO DO
+ Make own AccelMAX on motor controller very hight,  then use the sinusoidal equation above to modulate the position  
+ Make variable for idealPosition (at this time) defined by the sinusoidal, and then continually modulate the motorSpeed value toward this position
+ Make variable for idealPeriod then modulate the amplitudes and speeds toward this ideal
+ ***make pos=pos+(rotation*1000);
+ */
+
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <EasyTransferI2C.h>
+#include <TimerOne.h>
+
+#define rxPin 4  // pin 3 connects to smcSerial TX  (not used in this example)
+#define txPin 5  // pin 4 connects to smcSerial RX
+
+// some motor limit IDs
+#define FORWARD_ACCELERATION 5
+#define REVERSE_ACCELERATION 9
+
+//define slave i2c address
+#define THIS_ADDRESS 8
+#define ADDRESS 8
+
+SoftwareSerial smcSerial = SoftwareSerial(rxPin, txPin);
+
+//create object
+EasyTransferI2C ETin; 
+EasyTransferI2C ETout; 
+
+const int posPin=A3;   //analog input pin for position sensor
+//const int mSpeedPin = A0;  // Analog input pin for motor sensor1
+//const int mAmpPin = A1;  // Analog input pin for motor sensor2
+//const int centerPin = A2;  //analog input pin to determine center 
+//const int accelPin = A2;  //analog input pin to determine center height
+const int posPin2 = A2;
+
+
+const float pi = 3.141592; 
+
+//const int decelPin = A4;    ///*********** On UNO this conclicts with i2c pins
+//const int centerPin =A5;    ///*********** On UNO this conclicts with i2c pins
+
+
+const int  interuptPin1 =  2;
+const int interuptPin2 =3;
+
+
+int maxAccel= 1500;  //500;   //1000;  //0 to 3200          //faster maxAccel so that idealPos can control speed
+int  maxDecel= maxAccel; //500;    //1000;  //0 to 3200
+
+byte  maxAccel_b1= maxAccel & 0x7F;  //first byte of int
+byte  maxAccel_b2= maxAccel >> 7;  //second byte of int
+byte  maxDecel_b1= maxDecel & 0x7F;  //first byte of int
+byte  maxDecel_b2= maxDecel >> 7;  //second byte of int
+
+int pos= 1;   //position value read by sensor
+int pos_mapped=0;   //mapped to degrees from 0 to 359
+int posPrev=pos;
+int posPrev2=pos;
+int mSpeed = 50;        // value read from the pot
+int speedLeft=50;       //speed going left
+int speedRight=50;      //speed going right
+int mAmp = 250;        // value read from pot.  amplitude of wave
+int center = 500;      //value read by pot.  determines center of pendulum motion
+int interupt1 = 0;
+int interupt2 =0;
+long interuptCount=0;
+int mCount1=0;   //counts number of tiggers of mSensor1
+int mCount2=0;  //counts number of tiggers of mSensor2
+int mCountBoth=0;  //counts number of times that both mSense1 and mSense2 are simultaneously triggered
+int mCountHeight=42;  //adds counts height based on mCountBoth and dirSense of height//   42 is height of first hall sensor
+int waveCenterHeight=0;   //define this as starting center point
+int heightLeft=20;   //max height of wave
+int heightRight=-20;  // min height of wave
+int rotation=0;  // counts number of rotations
+int written=0;  //toggles when current values of variables have already been written to output screen
+int mDir=1;//direction of motor  (1 or -1)
+
+int currOffset,prevOffset;
+
+int leftMaxPos;   //maximum position of left swing (after decel) ,   initial value or right swing
+int rightMaxPos;   //maximum position of right swing (after decel) ,   initial value or left swing
+int rotationInitLeft=0;
+int rotationInitRight=0;
+int deltaPosLeft;
+int deltaPosRight;
+int velLeft;  //average velocity for for swing left
+int velRight;  // average velocity for swing right
+
+int idealPos;   //position = amplitude*cos(Time*2pi / Period)
+long idealPer  = 7000; //15000;  //in milliseconds  //set period   how long (how many counts) it should take for a complete rotation
+long idealVel;   //vel = amplitude*sin(Time*2pi / Period)   // i think this is right
+int idealMotorSpeed;   //idealVel mapped to 0 to 100
+int idealMotorSpeedAdjusted;   //remapp idealmotorspeed to make positions match
+float idealSpeedMultiplier = 1;   //
+int idealAccel=5;  // how much to incriment ideal pos value per cycle
+
+
+int dirSense=1;  //var determined by what sensors say about motor direction  1 or -1
+boolean knobs= 0;   // if on, knobs are used, if not knobs are not used to automatically change values
+
+int counter1_running=0;
+int counter2_running=0;
+
+unsigned long time1=micros();
+unsigned long timePrev=micros();
+unsigned long timePrev2=micros();
+unsigned long time2=micros();
+unsigned long timePeriod=0;
+unsigned long timeLeft=0;
+unsigned long timeRight=0;
+unsigned long timeLeft2=0;    //value obtained after slowdown
+unsigned long timeRight2=0;    //value obtained after slowdown
+
+
+long deltaPos= pos-posPrev;
+long deltaPos2= pos-posPrev2;
+long deltaTime= time1-timePrev; 
+long deltaTime2= time1-timePrev; 
+
+long vel=0;           //measured velocity
+long vel2=0;           //vel measuered accross a greater time span (two intervals)
+long velPrev=0;
+long velPrev2=0;       //velocity measured two times ago
+
+long accel=0;   // measured aacceleration
+long accel2=0;      //measured accross two time intervals
+
+
+
+
+struct DATA_STRUCTURE{
+  //put your variable definitions here for the data you want to send
+  //THIS MUST BE EXACTLY THE SAME ON THE OTHER ARDUINO
+  int idealPer;  
+  int pos; 
+  int center;
+  long time1;
+  //  int timeLeft;
+  //  int timeRight;
+  //  unsigned long pos;
+  //  long vel;
+  //  long accel;
+  //  int maxAccel;
+  //  int mAmp;
+  //   int mSpeed;
+  //  unsigned long timePeriod;
+  //  unsigned long interuptCount;
+};
+
+
+//give a name to the group of data
+DATA_STRUCTURE dataIn;
+DATA_STRUCTURE dataOut;
+
+
+
+// required to allow motors to move
+// must be called when controller restarts and after any error
+void exitSafeStart()
+{
+  smcSerial.write(0x83);
+}
+
+// speed should be a number from -3200 to 3200
+void setMotorSpeed(int speed)
+{
+  if (speed < 0)
+  {
+    smcSerial.write(0x86);  // motor reverse command
+    speed = -speed;  // make speed positive
+  }
+  else
+  {
+    smcSerial.write(0x85);  // motor forward command
+  }
+  smcSerial.write(speed & 0x1F);
+  smcSerial.write(speed >> 5);
+}
+
+
+// speed should be a number from -99 to 99
+void setMotorSpeedPercent(int motorSpeed)
+{
+  if(motorSpeed<0)
+  {  
+    motorSpeed=abs(motorSpeed);
+    mDir=-1;
+  }  
+  if( motorSpeed>99)
+  { 
+    motorSpeed=99;
+  }
+
+  byte zero= 0x00;
+  // smcSerial.write(0xAAD050099);
+  smcSerial.write(0xAA); // device 13
+  smcSerial.write(13); // device 13
+  if (mDir < 0)
+  {
+    smcSerial.write(0x06);  // motor reverse command   // motorSpeed = -motorSpeed;  // make speed positive
+    //motorSpeed= speedLeft;
+  }
+  else
+  {
+    smcSerial.write(0x05);  // motor forward command
+    //motorSpeed= speedRight;
+  }
+  smcSerial.write(zero);
+  smcSerial.write(motorSpeed);
+}
+
+
+void setMotorLimits()
+{
+  byte zero=0x00;
+  byte  maxAccel_b1= maxAccel & 0x7F;  //first byte of int
+  byte  maxAccel_b2= maxAccel >> 7;  //second byte of int
+  byte  maxDecel_b1= maxDecel & 0x7F;  //first byte of int
+  byte  maxDecel_b2= maxDecel >> 7;  //second byte of int
+
+  smcSerial.write(0xA2);
+  smcSerial.write(5);  //Forward accel id
+  smcSerial.write(maxAccel & 0x7F);
+  smcSerial.write(maxAccel_b2);
+  smcSerial.write(zero); 
+
+  smcSerial.write(0xA2);
+  smcSerial.write(9);  //Reverse accel id
+  smcSerial.write(maxAccel & 0x7F);
+  smcSerial.write(maxAccel_b2);
+  smcSerial.write(zero); 
+
+  smcSerial.write(0xA2);
+  smcSerial.write(2); //deceleration id
+  smcSerial.write(maxDecel & 0x7F);
+  smcSerial.write(maxDecel_b2);
+  smcSerial.write(zero); 
+
+  /* smcSerial.write(0xAA);
+   smcSerial.write(13);  //device number
+   smcSerial.write(0x22);
+   smcSerial.write(1);    //limit ID  //Max acceleration forward
+   smcSerial.write(maxAccel_b1);   //limit Byte 1
+   smcSerial.write(maxAccel_b2); //limit Byte 2
+   //  smcSerial.write(zero);    //Limit Byte 2
+   
+   
+   smcSerial.write(0xAA);
+   smcSerial.write(13);  //device number
+   smcSerial.write(0x22);
+   smcSerial.write(2);    //limit ID  //Max deceleration forward
+   smcSerial.write(maxDecel_b1);   //limit Byte 1
+   smcSerial.write(maxDecel_b2); //limit Byte 2
+   //  smcSerial.write(zero);    //Limit Byte 2
+   
+   
+   smcSerial.write(0xAA);
+   smcSerial.write(13);  //device number
+   smcSerial.write(0x22);
+   smcSerial.write(9);    //limit ID  //Max acceleration reverse
+   smcSerial.write(maxDecel_b1);   //limit Byte 1
+   smcSerial.write(maxDecel_b2); //limit Byte 2
+   
+   //  smcSerial.write(zero);    //Limit Byte 2
+   
+   
+   smcSerial.write(0xAA);
+   smcSerial.write(13);  //device number
+   smcSerial.write(0x22);
+   smcSerial.write(10);    //limit ID  //Max deceleration forward
+   smcSerial.write(maxDecel_b1);   //limit Byte 1
+   smcSerial.write(maxDecel_b2); //limit Byte 2
+   
+   // smcSerial.write(zero);    //Limit Byte 2
+   */
+}
+
+
+void setup()
+{
+
+  pinMode( interuptPin1, INPUT_PULLUP);   
+  pinMode( interuptPin2, INPUT_PULLUP);
+  pinMode(10, OUTPUT);      // sets the digital pin as output
+  pinMode(11, OUTPUT);      // sets the digital pin as output
+
+
+  Wire.begin(THIS_ADDRESS);
+  //start the library, pass in the data details and the name of the serial port. Can be Serial, Serial1, Serial2, etc.
+  ETin.begin(details(dataIn), &Wire);
+  Wire.onReceive(receive);
+
+  ETout.begin(details(dataOut), &Wire);
+
+
+  // initialize software serial object with baud rate of 19.2 kbps
+  smcSerial.begin(19200);//115200);   //19200);   //****IMPT***I had to manually change the motor controller settings to a fixed baud rate using the software that came with it
+
+  Timer1.initialize(20000); // set a timer of length 100000 microseconds (or 0.1 sec - or 10Hz => the led will blink 5 times, 5 cycles of on-and-off, per second)
+  Timer1.attachInterrupt( timerIsr ); // attach the service routine here
+
+
+  // the Simple Motor Controller must be running for at least 1 ms
+  // before we try to send serial data, so we delay here for 5 ms
+  delay(5);
+
+  Serial.begin(19200);//115200);
+  // if the Simple Motor Controller has automatic baud detection
+  // enabled, we first need to send it the byte 0xAA (170 in decimal)
+  // so that it can learn the baud rate
+  smcSerial.write(0xAA);  // send baud-indicator byte
+
+  // next we need to send the Exit Safe Start command, which
+  // clears the safe-start violation and lets the motor run
+  exitSafeStart();  // clear the safe-start violation and let the motor run
+  setMotorLimits();
+}
+
+void resetCounts()
+{
+  mCount1=0;
+  mCount2=0;
+  mCountBoth=0;
+  rotation=0;
+}
+
+
+void counter1()  //mSensor1 has changed value
+{
+
+}
+
+
+void counter2()
+{ 
+
+}
+
+
+void printValues()
+{
+  Serial.print(F("pos = "));    //actual position of pendulum
+  Serial.print(pos); 
+  Serial.print(F("currOffset = "));
+  Serial.print(currOffset);
+  Serial.print(F("prevOffset = "));
+  Serial.print(prevOffset);
+  Serial.print(F("            vel = "));
+  Serial.print(vel);
+  Serial.print(F("            rotation = "));
+  Serial.print(rotation);
+
+  Serial.print(F("            accel = "));
+  Serial.print(accel);
+  Serial.print("    deltaTime = ");
+  Serial.print(deltaTime);
+  Serial.print(F("                  timePeriod = "));    //actual position of pendulum
+  Serial.print(timePeriod); 
+
+  /*   Serial.print("            mSpeed= ");    //motor speed      read by pot
+   Serial.print(mSpeed);
+   Serial.print("          maxAccel= ");    //max accel     read by pot
+   Serial.print(maxAccel);
+   Serial.print("          maxDecel= ");    //max accel     read by pot
+   Serial.print(maxDecel);*/
+  Serial.print(F("                time1 = "));
+  Serial.print(time1);
+  Serial.print(F("                timePrev = "));
+  Serial.print(timePrev);
+  Serial.print(F("                deltaPos= "));
+  Serial.print(deltaPos);
+  Serial.print(F("                deltaTime = "));
+  Serial.print(deltaTime);
+  /*   Serial.print("vel * 10,0000 = ");
+   Serial.println(vel);
+   Serial.println("");
+   */
+  /*   Serial.print("          mAmp = ");    //how high pendulum oscilation is set   read by pot
+   Serial.print(mAmp); 
+   Serial.print("          center = ");   // center point of pendulum oscilation    read by pot
+   Serial.println(center); */
+  Serial.print("               interuptCount = ");
+  Serial.println(interuptCount);
+  Serial.println("");
+}
+
+void printVars2()
+{
+  Serial.print(F("pos = "));
+  Serial.print(pos);
+  Serial.print(F("    posPrev = "));
+  Serial.print(posPrev);
+  Serial.print(F("    posPrev2 = "));
+  Serial.print(posPrev2);
+  Serial.print(F("            vel = "));
+  Serial.print(vel);
+  Serial.print(F("    vel2 = "));
+  Serial.print(vel2);
+  Serial.print(F("    velPrev = "));
+  Serial.print(velPrev);
+  Serial.print(F("    velPrev2 = "));
+  Serial.print(velPrev2);
+  Serial.print(F("            accel = "));
+  Serial.print(accel);
+  Serial.print(F("    accel2 = "));
+  Serial.print(accel2);
+  Serial.print(F("    deltaPos = "));
+  Serial.print(deltaPos);
+  Serial.print(F("      deltaPos2 = "));
+  Serial.print(deltaPos2);   
+  Serial.print(F("      Rotation = "));
+  Serial.print(rotation);   
+
+  Serial.print(F("    deltaTime = "));
+  Serial.print(deltaTime);
+  Serial.print(F("    deltaTime2 = "));
+  Serial.print(deltaTime2);
+  Serial.print(F("    interuptCount = "));
+  Serial.println(interuptCount);
+
+}    
+
+
+void printStruct()
+{
+  Serial.println(F("________PRINT STRUCT_________"));
+  Serial.print(F("dataOut.center = ")); 
+  Serial.println(dataOut.center);
+  /*  Serial.print(F("dataOut.timeLeft = "));
+   Serial.println(dataOut.timeLeft);
+   Serial.print(F("dataOut.timeRight"));
+   Serial.println(dataOut.timeRight);*/
+  Serial.print(F("dataIn.center = ")); 
+  Serial.println(dataIn.center);
+  /*   Serial.print(F("dataIn.timeLeft = "));
+   Serial.println(dataIn.timeLeft);
+   Serial.print(F("dataIn.timeRight"));
+   Serial.println(dataIn.timeRight);*/
+}
+
+void updateVel()
+{
+  velPrev2=velPrev;
+  velPrev=vel;
+  deltaTime= time1-timePrev;
+  deltaTime2= time1-timePrev2;   //time of 2 intevervals
+  vel=(deltaPos*1000)/deltaTime;
+  vel2=(deltaPos2*1000)/deltaTime2;     //velocity calculated accross two time intervals
+  accel=((vel-velPrev)*1000)/deltaTime;
+  accel2=((vel-velPrev2)*1000)/deltaTime2;
+
+}
+
+void updatePos()
+{
+  int temp,temp2;  
+  posPrev2=posPrev;   //position from 2 reads ago
+  posPrev=pos;
+  prevOffset = currOffset;
+  //read position sensor*/
+  temp=analogRead(posPin);
+  temp2=analogRead(posPin2);  
+  pos_mapped=map(temp, 0, 1023, 0, 359 ); // maps from 0 to 359 degrees for a full rotation
+  currOffset = Math.abs(temp-temp2);
+  pos=map(temp, 41, 986, 0, 1000);
+  if(pos>750 || pos<250){
+    pos=map(temp2, 41, 986, 0, 1000);
+  }
+  //pos=map(temp, 41, 986,
+  //greater than 750 less than 250, read other pin instead, adjust by offset
+  deltaPos= pos-posPrev;
+  deltaPos2= pos-posPrev2;   //change in pos accross 2 time intervals
+
+  //     timePrev=time1;
+  //      time1=micros();
+}
+
+
+
+void testRotationBorder()  //tests to see if the the position has crossed the border values of the sensor
+{
+  int temp2=posPrev%1000;    //   because posPrev is potentially > than 1000  while pos is <1000    thus temp2  adjusts for this in comparison
+  int temp1=pos-temp2;    //posPrev
+  if(abs(temp1)>500)    //then the threshhold has been crossed
+  {
+    if((temp2>700) && (pos<400))
+    { 
+      rotation++;
+    }
+    else if((temp2<400) && (pos>700))
+    {   
+      rotation--;
+    }
+    /*New*********/
+    pos=pos+(rotation*1000);    
+    rotation=0;
+    /**********************/
+
+  }
+}
+
+
+void updateStructs()
+{
+  ETin.receiveData(); 
+  dataOut.center = center;
+  //   dataOut.timeLeft = timeLeft;
+  //   dataOut.timeRight = timeRight;
+  dataOut.idealPer=idealPer;  
+  dataOut.pos=pos;
+  dataOut.time1=time1;
+  /* myData.vel=vel;
+   myData.accel=accel;
+   myData.maxAccel=maxAccel;
+   myData.mAmp=mAmp;
+   myData.center=center;
+   myData.mSpeed=mSpeed;
+   myData.timePeriod=timePeriod;
+   myData.interuptCount=interuptCount;
+   */
+}
+
+
+void updateVars()
+{
+  timePrev2=timePrev;
+  timePrev=time1;
+  time1=millis();
+  updatePos();
+  updateVel();
+  updateStructs();
+  // ETout.sendData(ADDRESS);            //send data to ADDRESS
+  idealPos=int(mAmp*cos(time1*2*pi/idealPer)) + center; //position = amplitude*sin(Time*2*pi/Period)+center
+  idealVel= int(mAmp*sin(time1*2*pi/idealPer));    //vel = amplitude*sin(Time*2pi / Period)     //i bellieve this is right
+  if(idealVel<0) 
+    mDir=-1;
+  else if(idealVel>0)
+    mDir=1; 
+  idealMotorSpeed=map(abs(idealVel),0,mAmp,0,99);       // mapped idealVel to motorSpeedPercent
+  /*  if((vel<0)&&(velPrev>0))   ||   ((vel>0)&&(velPrev<0))
+   {  // then reset oscillation timer
+   }*/
+
+  int temp;  
+  if(knobs==1)
+  {     
+    temp=analogRead(mSpeedPin);   
+    mSpeed=map(temp, 0, 1023, 0, 100 ); // maps from 0 to 10 full rotation
+    temp=analogRead(mAmpPin);   
+    mAmp=map(temp, 0, 1023, 0, 1023 ); // maps from 0 to 10 full rotation
+    //    center=map(temp,0, 1023, 41,986); //map(temp, 0, 1023, 0, 359 ); // maps from 0 to 10 full rotation
+    temp=analogRead(accelPin);   
+    maxAccel= map(temp, 0, 1023,10, 100);  // default is 500,  goes max Accel can range from 0 to 3200 
+  }
+  maxDecel=maxAccel;   
+  //  temp=analogRead(decelPin);
+  // maxDecel=map(temp, 0, 1023,5, 2500);  // default is 500,  goes max Accel can range from 0 to 3200 
+
+  testRotationBorder();    //tests to see if the the position has crossed the border values of the sensor  ALso UPDATES POS
+
+}
+
+
+void updateDeltaPosLeft()  
+{
+  // pendulum swung left from rightMaxPos to leftMaxPos
+  int temp=0;
+  int deltaRotations=rotationInitLeft-rotationInitRight;
+  if(deltaRotations!=0)  //if yes then zero value was crossed
+  {     
+    temp=1000*(deltaRotations-1);     
+    deltaPosLeft=(1000-leftMaxPos)+rightMaxPos+temp;
+    return;
+  }
+  else    //if yes then zero was not crossed
+  {      
+    deltaPosLeft=rightMaxPos-leftMaxPos;
+    return;
+  }
+}
+
+void updateDeltaPosRight()  
+{
+  // pendulum swung left from rightMaxPos to leftMaxPos
+  int temp=0;
+  int deltaRotations=rotationInitRight-rotationInitLeft;
+  if(deltaRotations!=0)  //if yes then zero value was crossed
+  {     
+    temp=1000*(deltaRotations-1);  
+    deltaPosRight=(1000-leftMaxPos)+rightMaxPos+temp;
+    return;
+  }
+  else    //if yes then zero was not crossed
+  {      
+    deltaPosRight=rightMaxPos-leftMaxPos;
+    return;
+  }
+}
+
+void gotoPos(int p)
+{
+  Serial.print("gotoPos (p)     p= ");
+  Serial.println(p);
+  printValues();
+  while((p!=pos)&&(p!=(pos+1))&&(p!=(pos-1)))  //gives a tolerance while p!=pos +-1
+  {
+    updatePos();
+    //  printValues();
+    /*   Serial.print("pos = ");
+     Serial.println(pos);
+     Serial.print("p = ");
+     Serial.println(p);*/
+  }
+  return;
+}
+
+
+
+void goRightToPos(int p)   
+{
+  int tZero=millis(); 
+  int posInit=pos;   //initial pos when function is called
+  int rotationInit=rotation;   //initial value of rotation when function is called
+  int gotoRotation=0;//rotationInit;   //the desired rotation variable
+  rotation=0;      //new
+
+  mDir=1;      //pos increases
+  setMotorLimits();
+  //  updateVars();
+  Serial.println("");
+  Serial.println("");
+  Serial.print(F("RRRRRRRRRRRRRRRR     Go RIGHT to "));
+  Serial.println(p);
+
+  //  printValues();
+
+  while(p>1000)
+  {    
+    p=p-1000;
+    gotoRotation++;
+  }
+
+  while(p<(-1000))
+  {    
+    p=p+1000;
+    gotoRotation++;
+  }
+  while(p<0)  //p is thus between -1000 and 0
+  {
+    p=1000+p;
+  }
+
+  if (posInit>p)   //then pos needs to pass over full-turn-threshold which will increment rotation, thus account for this by incrimenting gotorotation     //41 is minimum read of pot,   986 is maximum
+  {     
+    gotoRotation++;          
+    /*  Serial.println(F("posInit>p"));
+     Serial.print(F("gotoRotation = "));
+     Serial.println(gotoRotation);
+     printValues();*/
+    setMotorLimits();   
+  }    
+
+  int temp= rotation;
+  while((vel<0)||(velPrev<0))    // if yes then motor is still slowing down heading in the wrong direction,   check previous velocities to insure sensor is not at the jump point
+    //  while((vel2<0)||(velPrev2<0))    // if yes then motor is still slowing down heading in the wrong direction,   check previous velocities to insure sensor is not at the jump point
+  {
+
+    //wait for deceleration to complete
+    /*  Serial.print(F(" SSSSSSSSSSSSSSSSSSSSSSSSSSS    SLOWING   Motor is slowing down,        "));
+     Serial.print(F("while(vel<0), vel = "));
+     printValues();*/
+    setMotorLimits(); 
+    if(rotation!=temp)  //if it crossed border then
+    {//gotoRotation++;
+    }   
+  }
+  timeLeft2=timeLeft+(millis()-tZero);
+  /*     Serial.println(F(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"));
+   Serial.print("timeLeft = ");
+   Serial.print(timeLeft);
+   Serial.print(F("             timeLeft2 = "));
+   Serial.println(timeLeft2);
+   Serial.println(F(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"));  */
+  tZero=millis();   //reset tZero after deceleration,  begin accel right
+  //       rotation=0;
+  //     gotoRotation=0;
+
+
+  //*******Begin ACCEL RIGHT
+  Serial.print("Begin ACCEL RIGHT     pos = ");
+  Serial.println(pos);
+  leftMaxPos = pos;   //maximum position of left swing ,   initial value or right swing
+  rotationInitRight=rotation;
+  updateDeltaPosLeft();    // updates DeltaPosLeft  which tracks how much left swing was traveled 
+
+  if(gotoRotation<rotation)   // error has occured
+  {
+    Serial.println(F("gotoRotation<rotation               RETURN  from right    YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"));  //ERROR has occured
+    rotation=0;
+    return;
+  }       
+
+
+
+
+  while(rotation<gotoRotation)  //continue turining until rotation incriments to gotoRotation value
+  {
+    /*  Serial.print(F("while(rotation<gotoRotation)"));
+     Serial.print(F("        gotoRotation = "));
+     Serial.print(gotoRotation);
+     Serial.print(F("         p = "));
+     Serial.print(p);
+     Serial.print(F("         Rotation = "));
+     Serial.println(rotation);
+     printValues();
+     */
+    setMotorLimits();
+  }   
+
+  while(pos<p)    //continue until pos gets to p value
+  {
+    // Serial.println(F("while( pos<p  )")); 
+    if(gotoRotation<rotation)     //check for error
+    {      
+      Serial.print(F("ERROR gotoRotation<rotation  in gotoPos Right   RETURN"));
+      rotation=0;  
+      return;
+    }
+    //  Serial.print("p =  "); 
+    // Serial.println(p);
+    //    printValues();
+    setMotorLimits();
+  }
+  //  updateVars();
+  //  delay(5);
+  //    printVars2();
+  //      ET.sendData(I2C_SLAVE_ADDRESS);
+  //   Serial.println("");
+  //   printValues();
+  setMotorLimits();
+  //         rotation=0;
+  Serial.println(F("**End goRight()"));
+  Serial.println("");
+  Serial.println("");
+  timeRight=millis()-tZero;
+  //  dataIn.timeRight=timeRight;
+}
+
+
+void goLeftToPos(int p)   
+{
+  int tZero=millis();
+  int posInit=pos;   //initial pos when function is called
+  int rotationInit=rotation;   //initial value of rotation when function is called
+  int gotoRotation=0;//rotationInit;   //=0;   //the desired rotation variable
+  rotation=0;             //new;
+
+  mDir=-1;      //pos increases
+  setMotorLimits();
+  //  updateVars();
+  Serial.println("");
+  Serial.println("");
+  Serial.print(F("LLLLLLLLLLLLLLLLLLLLL     Go LEFT to "));
+  Serial.println(p);
+  //  printValues();
+
+  //*******
+  while(p>1000)
+  {    
+    p=p-1000;
+    gotoRotation--;
+  }
+
+  while(p<(-1000))
+  {    
+    p=p+1000;
+    gotoRotation--;
+  }
+  while(p<0)  //p is t/hus between -1000 and 0
+  {
+    p=1000+p;
+  }
+
+  if (posInit<p)   //then pos needs to pass over full-turn-threshold which will decrement rotation value, thus account for this by decrimenting gotoRotation     //41 is minimum read of pot,   986 is maximum
+  {     
+    gotoRotation--;          
+    /*    Serial.println(F("pos<p")) ;
+     Serial.print(F("gotoRotation = "));
+     Serial.println(gotoRotation);
+     printValues();
+     */
+    setMotorLimits();   
+  }    
+
+
+  int temp=rotation;
+  while((vel>0)||(velPrev>0))    // if yes then motor is still slowing down heading in the wrong direction,   check previous velocities to insure sensor is not at the jump point
+  {
+    //wait for deceleration to complete
+    /*           Serial.print(F(" SSSSSSSSSSSSSSSSSSSSSSSSSSS    SLOWING   Motor is slowing down,        ")) ;
+     Serial.println(F("while(vel<0), vel = "));
+     printValues();
+     */
+    setMotorLimits();
+    if(rotation!=temp)  //if it crossed border then
+    {    //gotoRotation++;
+    }
+  }
+  timeRight2=timeRight+(millis()-tZero);    //Slowdown is complete,  mark timeright2,  and then start moving left
+  /*      Serial.println(F(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"));
+   Serial.print(F("timeRight = "));
+   Serial.print(timeRight);
+   Serial.print("             timeRight2 = ");
+   Serial.println(timeRight2);
+   Serial.println(F(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"));
+   */
+  tZero=millis();   //reset tZero  and begin moving left
+  //  rotation=0;
+  // gotoRotation=0;
+
+
+  //*******Begin ACCEL LEFT
+  rightMaxPos = pos;   //maximum position of right swing ,   initial value or left swing
+  rotationInitLeft=rotation;
+  updateDeltaPosRight();    // updates DeltaPosLeft  which tracks how much left swing was traveled   
+
+
+  if(gotoRotation>rotation)   // error has occured
+  {
+    Serial.println(F("gotoRotation>rotation               RETURN  from LEFT    XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"));  //ERROR has occured
+    rotation=0;
+    return;
+  }       
+  while(rotation>gotoRotation)  //continue turining until rotation incriments to gotoRotation value
+  {
+    /*          Serial.print(F("while(rotation>gotoRotation)"));
+     Serial.print(F("        gotoRotation = "));
+     Serial.print(gotoRotation);
+     Serial.print("         p = ");
+     Serial.print(p);
+     Serial.print(F("         Rotation = "));
+     Serial.println(rotation);
+     //       printValues();
+     */
+    setMotorLimits();
+  }   
+
+  while(pos>p)    //continue left until pos gets to p value
+  {
+    // Serial.println(F("while( pos>p  )")); 
+    if(gotoRotation>rotation)     //check for error
+    {      
+      Serial.print(F("ERROR gotoRotation>rotation  in goLefttoPos   RETURN"));
+      rotation=0;  
+      return;
+    }
+    /*        Serial.print("p =  "); 
+     Serial.println(p);
+     //        printValues();*/
+    setMotorLimits();
+  }
+  //  updateVars();
+  //  delay(5);
+  //    printVars2();
+  //      ET.sendData(I2C_SLAVE_ADDRESS);
+  Serial.println("");
+  //        printValues();
+  setMotorLimits();
+  //        rotation=0;
+  Serial.println(F("**End goLeft()"));
+  Serial.println("");
+  Serial.println("");
+  timeLeft=millis()-tZero;
+  //      dataIn.timeLeft=timeLeft;
+
+}
+
+void printTime()
+{
+  Serial.println(F("______________________________________________________________________________________________________________"));
+  Serial.print(F("timeRight = "));
+  Serial.print(timeRight);
+  Serial.print(F("               timeRight2 = "));
+  Serial.println(timeRight2);
+  Serial.print("timeLeft = ");
+  Serial.print(timeLeft);
+  Serial.print(F("             timeLeft2 = "));
+  Serial.println(timeLeft2);
+  Serial.println("");
+  Serial.print("speedLeft = ");
+  Serial.print(speedLeft);
+  Serial.print(F("             speedRight = "));
+  Serial.println(speedRight);
+
+  Serial.println("");
+  Serial.print("rightMaxPos ="); 
+  Serial.println(rightMaxPos); 
+  Serial.print("leftMaxPos =");
+  Serial.println(leftMaxPos); 
+  Serial.print("deltaPosRight ="); 
+  Serial.println(deltaPosRight); 
+  Serial.print("deltaPosLeft ="); 
+  Serial.println(deltaPosLeft); 
+  Serial.println(F("______________________________________________________________________________________________________________"));
+}
+
+void  equalizeLeftRight()
+// adjust speeds to make time left mach time right
+{    
+  if(timeLeft2<timeRight2)
+  {   
+    if(speedLeft<97)
+    {
+      speedLeft+=3;
+    }
+    else if(speedRight>=94)      // determine if we need to decriment speedRight,  if not we can incriment SpeedLeft instead
+    {
+      speedRight-=2;
+    }
+
+  }
+  else if(timeRight2<timeLeft2)
+  {
+    if(timeRight2<timeLeft2)
+    {   
+      if(speedRight<97)
+      {
+        speedRight+=3;
+      }
+      else if(speedLeft>=94)  // determine if we need to decriment speedLeft,  if not we can incriment SpeedRight instead
+      {
+        speedLeft-=2;
+      }
+
+    }
+    setMotorSpeedPercent(mSpeed);
+    // printVars2(); 
+  }
+}
+
+void pattern1()
+{
+  center=500;  //0;
+
+  mAmp=200;
+  int p1;  // position to go to
+  int p2;    // position to go to
+  p1=center+mAmp;
+  p2=center-mAmp;
+  gotoPos(center); 
+  //   goLeftToPos(center);
+  //   mSpeed=0;
+  //delay(200);
+  // maxAccel=1000;
+  //gotoPos(center);
+  delay(500);
+  maxAccel=100;
+  mSpeed=100;
+  speedLeft=100;
+  speedRight=100;
+  mDir=1;                     //set direction  TEMP
+  setMotorLimits();
+  int x=1;
+  /*   while(1)   //debug loop
+   {
+   //printValues();
+   printVars2();
+   if(deltaPos<0)
+   {
+   Serial.println("");  
+   Serial.println("  DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD             Delta P<0");    
+   }
+   }
+   */  //end debug loop
+
+  while(1)
+  {
+    while(x<10)
+    {
+      //updateStructs();
+      maxAccel=28;
+      mSpeed=100;
+      setMotorLimits();
+      setMotorSpeedPercent(mSpeed);
+      //   p1+=(x*5);
+      // p2-=(x*5);
+      Serial.print(F("*****PATTERN 1******"));
+      Serial.print("center = ");
+      Serial.print(center);
+      Serial.print("p1 = ");
+      Serial.print(p1);
+      Serial.print("               p2 = ");
+      Serial.println(p2);
+      //   p1=center+mAmp;
+      goRightToPos(p1);
+      // p2=center-mAmp;
+      goLeftToPos(p2);
+      printTime();
+      x++;
+
+
+      Serial.println("ETout.sendData");
+      ETout.sendData(ADDRESS);            //send data to ADDRESS
+      Serial.println("printStruct");
+      printStruct();
+
+    }
+    x=1; 
+    //   mSpeed=0;
+    //    delay(1000);
+    //   center+=250;
+    maxAccel=100;
+    //  mSpeed=30;
+    setMotorLimits();
+    //    goRightToPos(center);
+    //  mSpeed=0;
+    //  delay(1000);
+    if(center>999)
+      center= center-1000;
+    p1=center+mAmp; 
+    p2=center-mAmp; 
+    Serial.println(F("end if while(x<10)"));   
+    Serial.print(F("center = "));
+    Serial.print(center);                                                                                                                       
+    Serial.print(F("p1 = "));
+    Serial.print(p1);
+    Serial.print(F("               p2 = "));
+    Serial.println(p2);
+  }
+
+
+}
+
+void adjustSpeed()  //incriments or decriments mSpeed towards idealPos
+//Assumes the zero value of position is not crossed
+{
+  long temp;
+  if(mDir==1)
+  {
+    if(idealPos<(pos+(rotation*1000)))   //if yes then make slower to let idealpos catch up
+    {  
+      temp= mSpeed-idealAccel;
+      if(temp>99)  temp=99;
+      else if(temp<1) temp=0;
+      mSpeed=temp; 
+    }
+    else   //idealPos>=pos
+    {
+      temp= mSpeed+idealAccel;
+      if(temp<1) temp=0;
+      else if(temp>99)  temp=99;
+      mSpeed=temp;
+    }
+  }
+  else   //mdir==-1
+  {
+    if(idealPos<(pos+(rotation*1000)))
+    {  
+      temp=mSpeed-idealAccel;
+      if(temp>99)  temp=99;
+      else if(temp<1) temp=0;     
+      mSpeed=temp; 
+    }
+    else
+    {
+      temp= mSpeed+idealAccel;
+      if(temp<1) temp=0;
+      else if(temp>99)  temp=99;
+      mSpeed=temp; 
+    }
+  }
+}
+
+void timerIsr() //called every 1000 microseconds  or something
+{
+  updateVars();
+  //adjustSpeed();
+  //  setMotorSpeedPercent(mSpeed);
+  //setMotorLimits();
+  interuptCount++;
+  // Serial.println("timerISR****");
+}
+
+
+void loop()
+{
+
+  mSpeed=50;
+  mDir=1;
+  setMotorSpeedPercent(mSpeed);
+  center= 500;
+  gotoPos(center);   
+  mSpeed=50;  
+  while(1)
+  { 
+    mSpeed=50;
+    //       setMotorSpeedPercent(mSpeed);
+    printValues();
+
+  }
+
+
+
+  while(1)
+  {   
+
+    //adjustSpeed();
+    mSpeed=idealMotorSpeed;
+    setMotorSpeedPercent(mSpeed);
+    ETout.sendData(ADDRESS);            //send data to ADDRESS
+    Serial.print(F("idealPos = "));
+    Serial.print(idealPos);
+    Serial.print(F("     pos = "));
+    Serial.print(pos);
+    Serial.print(F("     mSpeed = "));
+    Serial.print(mSpeed);
+    Serial.print(F("      idealVel =     "));
+    Serial.print(idealVel);
+    Serial.print(F("     mDir = "));
+    Serial.print(mDir);
+    Serial.print(F("     rotation = "));
+    Serial.println(rotation);
+  }
+  mSpeed= 100;
+  knobs=0;     //no knobs attached
+  updateVars();
+  Serial.print("pos = ");
+  Serial.println(pos);
+  Serial.println("");
+  mDir=1;
+
+
+  setMotorSpeedPercent(mSpeed);
+  int p1 = 250;  // position to go to
+  int p2= 750;    // position to go to
+  Serial.println(F("BEGININNG "));
+  printValues();
+
+
+  //gotoPos(center);
+  goLeftToPos(center);
+  //  setMotorSpeedPercent(0);
+
+  Serial.println(F("at center"));
+  time1=millis();
+  rotation=0;
+  while(1)
+  { 
+    Serial.print(F("####1   pos= "));
+    Serial.println(pos);
+
+    /*     //  if((pos>340)||(pos<20))         // this is bad zone of position sensor
+     if((pos>970)||(pos<57))         // this is bad zone of position sensor
+     {   Serial.println("************RESET POS______   goto 500");
+     gotoPos(512);
+     }
+     */
+
+    p1=center-mAmp;   //A1  (middle knob)
+    p2=center+mAmp;    //A1
+    Serial.println(F("**********************************************************************************"));
+    Serial.print("p1 = ");   
+    Serial.print(p1);  
+    Serial.print("         p2= ");  
+    Serial.println(p2);
+    //       maxAccel= map(maxAccel, 0, 1023,5, 2500);    // default is 500,  goes max Accel can range from 0 to 3200   //center pin is A2
+    //      maxDecel= map(maxDecel, 0, 1023, 5, 250);    //1000;  //0 to 3200
+    setMotorLimits();
+
+
+    /*       while(1)
+     {
+     setMotorSpeedPercent(mSpeed);
+     goLeftToPos(800); //center-600);
+     setMotorSpeedPercent(0);
+     printValues();
+     //     delay(4000);
+     
+     setMotorSpeedPercent(mSpeed);
+     goRightToPos(600);  //center+400);
+     setMotorSpeedPercent(0);
+     printValues();
+     //    delay(4000);
+     
+     // goRightToPos(center);
+     } 
+     */
+    while(1)
+    { 
+      pattern1();
+    }
+    delay(5);
+    Serial.println(F("<<<<<<<<<<<<-------------------------<<<<<<<<<<<<<go Left to p1"));
+    int tZero=micros();
+    timePeriod=0;
+    goLeftToPos(p1);
+
+    printValues();
+    Serial.print(F("******************************************  Time Left = "));
+    Serial.println(timeLeft);
+    Serial.print("");
+    Serial.println(F(">>>>>>>>>>>>>_____________________________>>>>>>>>>go Right to p2"));
+    tZero=micros();
+    timePeriod=0;
+    goRightToPos(p2);
+    timePeriod=millis()-tZero;
+    printValues();
+    Serial.print(F("******************************************  timeRight = "));
+
+    Serial.println(timeRight);
+    Serial.print("");
+
+    timePeriod=millis()-tZero;
+
+
+    delay(5);
+
+  }      
+
+}
+
+
+
+void receive(int numBytes) {
+}
+
